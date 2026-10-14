@@ -58,6 +58,10 @@ to pick the `chunks` folder (or drop it on the window) and runs entirely from
 memory. This is the path that makes the single file usable without hosting
 anything.
 
+Pick the `chunks` **folder itself**, not its parent and not one file at a time —
+the page needs all 69 parts. It counts what you selected and tells you exactly
+what is missing if the pick is short, so you can try again without reloading.
+
 **One file** — `--inline-all`, as above. Needs nothing beside it.
 
 ## How the assets are served from inside the document
@@ -90,7 +94,12 @@ fetched and concatenated in manifest order, and `createUnityInstance` receives t
 resulting config. It runs against both the external-chunk build and an
 `--inline-all` build.
 
-Both pass here: 86 and 23 checks.
+The folder picker is driven the way a user drives it: the button click has to open
+the file dialog, a dropped folder has to be walked through its directory entries,
+a short or wrong pick has to be reported and leave the picker open for another
+try, and one full pick has to serve both the data and the wasm group.
+
+Both pass here: 103 and 23 checks.
 
 One thing that is **not** covered: this sandbox has no browser, so Unity itself
 was never executed. Everything up to and including the config handed to

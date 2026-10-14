@@ -467,27 +467,163 @@ check('http probe falls back to a ranged GET', fallbackBlob.size === httpPart1.l
   httpLog.join(' -> '));
 check('http chunk blob carries the manifest MIME type', httpBlob.type === 'application/octet-stream');
 
-/* --- chunk group loader: falls back to the picker when not served --- */
+/* --- chunk group loader: local folder picker ------------------------ *
+ * Drives the picker the way a user does: click the button, pick a folder,
+ * drop a folder, pick the wrong thing. */
+const tick = () => new Promise((r) => setTimeout(r, 5));
+
+function fakeEl(id, extra) {
+  const listeners = {};
+  return Object.assign({
+    id,
+    _listeners: listeners,
+    addEventListener(t, fn) { (listeners[t] = listeners[t] || []).push(fn); },
+    removeEventListener(t, fn) { listeners[t] = (listeners[t] || []).filter((f) => f !== fn); },
+    fire(t, ev) { for (const fn of (listeners[t] || []).slice()) fn(ev); }
+  }, extra || {});
+}
+/* File objects are Blobs with a name, so they work as Blob parts. */
+function namedBlob(name, bytes) { const b = new Blob([bytes]); b.name = name; return b; }
+function fileEntry(file) { return { isFile: true, isDirectory: false, file: (ok) => ok(file) }; }
+function dirEntry(children) {
+  return {
+    isFile: false,
+    isDirectory: true,
+    createReader() {
+      let done = false;
+      return { readEntries: (ok) => (done ? ok([]) : (done = true, ok(children))) };
+    }
+  };
+}
+
+const docListeners = {};
+globalThis.document.addEventListener = (t, fn) => { (docListeners[t] = docListeners[t] || []).push(fn); };
+
+function installPickerPanel() {
+  const input = fakeEl('file-input', { files: [], clicks: 0, click() { this.clicks++; } });
+  const status = fakeEl('chunk-picker-status', { textContent: '' });
+  const panel = fakeEl('chunk-picker', {
+    hidden: true,
+    querySelector(sel) {
+      if (sel === 'input[type=file]') return input;
+      if (sel === '#chunk-picker-status') return status;
+      return null;
+    }
+  });
+  globalThis.document.getElementById = (id) => {
+    if (id === 'chunk-picker') return panel;
+    return blocks.has(id) ? { textContent: blocks.get(id) } : null;
+  };
+  return { panel, input, status };
+}
+
+/* Nothing on disk: every probe 404s, so the picker is the only way forward. */
 globalThis.fetch = () => Promise.resolve(new Response(null, { status: 404 }));
-let pickerAsked = false;
-globalThis.document.getElementById = (id) => {
-  if (id === 'chunk-picker') {
-    pickerAsked = true;
-    return {
-      hidden: true,
-      querySelector: () => ({ addEventListener() {}, files: [], click() {} }),
-      addEventListener() {}
-    };
-  }
-  return blocks.has(id) ? { textContent: blocks.get(id) } : null;
+
+const pickData = ['chunks/build.data.part001', 'chunks/build.data.part002', 'chunks/build.data.part003'];
+const pickWasm = ['chunks/build.wasm.part001', 'chunks/build.wasm.part002'];
+const dataGroup = { label: 'build.data', type: 'application/octet-stream', parts: pickData };
+const wasmGroup = { label: 'build.wasm', type: 'application/wasm', parts: pickWasm };
+const pickedBytes = {
+  'build.data.part001': Buffer.from([0xa1, 0xa2]),
+  'build.data.part002': Buffer.from([0xb1]),
+  'build.data.part003': Buffer.from([0xc1, 0xc2, 0xc3]),
+  'build.wasm.part001': Buffer.from([0xd1, 0xd2]),
+  'build.wasm.part002': Buffer.from([0xe1])
 };
-const pickerOutcome = await Promise.race([
-  solo.loadChunkGroup({ label: 'build.data', type: 'application/octet-stream', parts: ['chunks/build.data.part001'] })
-    .then(() => 'resolved', () => 'rejected'),
-  new Promise((r) => setTimeout(() => r('pending'), 300))
-]);
-check('missing chunks wait for a folder pick', pickerOutcome === 'pending', pickerOutcome);
-check('folder picker is surfaced', pickerAsked);
+const pickedFiles = Object.entries(pickedBytes).map(([name, bytes]) => namedBlob(name, bytes));
+
+/* A: the button has to actually open the dialog */
+{
+  solo._resetLocalSelection();
+  const ui = installPickerPanel();
+  let settled = null;
+  solo.loadChunkGroup(dataGroup).then(() => { settled = 'resolved'; }, (e) => { settled = e.message; });
+  await tick();
+  check('picker panel is shown when no chunks are reachable', ui.panel.hidden === false);
+  check('picker explains what to do', /chunks/i.test(ui.status.textContent), ui.status.textContent.slice(0, 48) + '…');
+  /* The <button> sits inside a .card, so its click reaches the panel by bubbling. */
+  ui.panel.fire('click', { target: { tagName: 'BUTTON' } });
+  check('clicking the button opens the file dialog', ui.input.clicks === 1, 'input.click() calls: ' + ui.input.clicks);
+  ui.panel.fire('click', { target: ui.panel });
+  check('clicking the panel background also opens it', ui.input.clicks === 2, 'input.click() calls: ' + ui.input.clicks);
+  ui.panel.fire('click', { target: ui.input });
+  check('clicking the input itself does not recurse', ui.input.clicks === 2, 'input.click() calls: ' + ui.input.clicks);
+
+  /* B: an unrecognised selection is reported, and does not resolve */
+  ui.input.files = [namedBlob('readme.txt', Buffer.from('hi')), namedBlob('build.data', Buffer.from('x'))];
+  ui.input.fire('change');
+  await tick();
+  check('unrecognised selection is reported and rejected nowhere',
+    settled === null && /Nothing recognised/.test(ui.status.textContent),
+    'settled=' + settled + ' | ' + ui.status.textContent.slice(0, 40) + '…');
+  check('picker stays visible after a bad pick', ui.panel.hidden === false);
+
+  /* C: a short pick is reported, keeps the picker open, and can be retried */
+  ui.input.files = [pickedFiles[0]];
+  ui.input.fire('change');
+  await tick();
+  check('short selection is reported with a count and not accepted',
+    settled === null && ui.panel.hidden === false &&
+    /found 1 of 3 build\.data\.partNNN/i.test(ui.status.textContent),
+    'settled=' + settled + ' | ' + ui.status.textContent);
+  check('shortfall helper names the missing group',
+    solo.shortfall([pickedFiles[0]], 'data', 3) === 'found 1 of 3 build.data.partNNN' &&
+    solo.shortfall([pickedFiles[0]], 'data', 1) === null);
+}
+
+/* D: one full pick serves both groups, in part order, ignoring other files */
+{
+  solo._resetLocalSelection();
+  const ui = installPickerPanel();
+  const dataPromise = solo.loadChunkGroup(dataGroup);
+  await tick();
+  /* shuffled, with junk mixed in */
+  ui.input.files = [pickedFiles[4], namedBlob('credits.json', Buffer.from('{}')), pickedFiles[2],
+    pickedFiles[0], pickedFiles[3], pickedFiles[1]];
+  ui.input.fire('change');
+  const dataBlob = await dataPromise;
+  check('full pick closes the picker', ui.panel.hidden === true);
+  check('data group built from the picked files',
+    Buffer.from(await dataBlob.arrayBuffer()).equals(
+      Buffer.concat([pickedBytes['build.data.part001'], pickedBytes['build.data.part002'], pickedBytes['build.data.part003']])),
+    dataBlob.size + ' bytes in part order');
+  check('data blob ignores non-chunk files', dataBlob.size === 6, dataBlob.size + ' bytes');
+
+  /* the wasm group must reuse the same pick, not ask again */
+  const clicksBefore = ui.input.clicks;
+  const wasmBlob = await solo.loadChunkGroup(wasmGroup);
+  check('second group reuses the same pick', ui.input.clicks === clicksBefore, 'no extra dialog');
+  check('wasm group built from the same pick',
+    Buffer.from(await wasmBlob.arrayBuffer()).equals(
+      Buffer.concat([pickedBytes['build.wasm.part001'], pickedBytes['build.wasm.part002']])),
+    wasmBlob.size + ' bytes');
+  check('wasm blob carries the wasm MIME type', wasmBlob.type === 'application/wasm');
+}
+
+/* E: dropping the folder (a directory, which never appears in dataTransfer.files) */
+{
+  solo._resetLocalSelection();
+  const ui = installPickerPanel();
+  const dataPromise = solo.loadChunkGroup(dataGroup);
+  await tick();
+  const dt = {
+    files: [],
+    items: [{ webkitGetAsEntry: () => dirEntry(pickedFiles.map((f) => fileEntry(f))) }]
+  };
+  ui.panel.fire('drop', { preventDefault() {}, dataTransfer: dt });
+  const blob = await dataPromise;
+  check('dropped folder is walked and used', blob.size === 6, blob.size + ' bytes');
+  check('dropped folder closes the picker', ui.panel.hidden === true);
+}
+
+/* F: a drop that misses the panel must not navigate the page away */
+check('document guards against stray drops', (docListeners.drop || []).length > 0 &&
+  (docListeners.dragover || []).length > 0);
+let navigated = false;
+for (const fn of docListeners.drop || []) fn({ preventDefault() { navigated = true; } });
+check('stray drop is prevented', navigated);
+
 globalThis.fetch = vfsFetch;
 
 

@@ -390,11 +390,6 @@
    * chunk resolution
    * ------------------------------------------------------------------ */
 
-  function partIndex(name) {
-    var m = /\.part(\d+)$/.exec(String(name));
-    return m ? parseInt(m[1], 10) : -1;
-  }
-
   /*
    * Decide whether the chunk parts are reachable over HTTP.  Try HEAD first so a
    * static host that does not implement Range does not ship an 18 MiB part just
@@ -411,48 +406,182 @@
       .catch(function () { return false; });
   }
 
-  function pickLocalFiles(wantedLabels) {
-    return new Promise(function (resolve, reject) {
-      var panel = g.document && g.document.getElementById('chunk-picker');
-      if (!panel) { reject(new Error('No local file picker available.')); return; }
-      panel.hidden = false;
-      var input = panel.querySelector('input[type=file]');
-      var status = panel.querySelector('#chunk-picker-status');
+  /* ------------------------------------------------------------------ *
+   * picking the chunk parts off local disk (file:// pages, no server)
+   * ------------------------------------------------------------------ */
 
-      function accept(fileList) {
-        var files = Array.prototype.slice.call(fileList || []);
-        var wanted = files.filter(function (f) { return /^build\.(data|wasm)\.part\d+$/.test(f.name); });
-        if (wanted.length === 0) {
-          if (status) status.textContent = 'No build.data.partNNN / build.wasm.partNNN files found in that selection. Try again.';
-          return;
-        }
-        wanted.sort(function (a, b) {
-          var la = /\.data\./.test(a.name) ? 0 : 1;
-          var lb = /\.data\./.test(b.name) ? 0 : 1;
-          return (la - lb) || (partIndex(a.name) - partIndex(b.name));
-        });
-        panel.hidden = true;
-        resolve(wanted);
-      }
+  var CHUNK_PART = /^build\.(data|wasm)\.part(\d+)$/;
+  var localSelection = null; // one pick serves both the data and the wasm group
 
-      if (input) {
-        input.addEventListener('change', function () { accept(input.files); });
-      }
-      panel.addEventListener('dragover', function (e) { e.preventDefault(); });
-      panel.addEventListener('drop', function (e) {
-        e.preventDefault();
-        accept(e.dataTransfer && e.dataTransfer.files);
-      });
-      panel.addEventListener('click', function (e) {
-        if (e.target === panel && input) input.click();
-      });
-      if (status) status.textContent = 'Select the "chunks" folder (' + wantedLabels + ' files).';
+  function isChunkPart(file) { return CHUNK_PART.test(file.name); }
+
+  function byPart(a, b) {
+    var ma = CHUNK_PART.exec(a.name);
+    var mb = CHUNK_PART.exec(b.name);
+    if (ma[1] !== mb[1]) return ma[1] === 'data' ? -1 : 1;
+    return parseInt(ma[2], 10) - parseInt(mb[2], 10);
+  }
+
+  function toArray(list) {
+    var out = [];
+    if (!list) return out;
+    for (var i = 0; i < list.length; i++) out.push(list[i]);
+    return out;
+  }
+
+  function entryToFile(entry) {
+    return new Promise(function (resolve) {
+      entry.file(function (f) { resolve(f); }, function () { resolve(null); });
     });
   }
 
-  function groupFromFiles(files, label) {
-    var parts = files.filter(function (f) { return f.name.indexOf('build.' + label + '.part') === 0; });
-    if (parts.length === 0) throw new Error('The selected files do not include build.' + label + '.partNNN.');
+  function readDirectory(entry) {
+    return new Promise(function (resolve) {
+      var reader = entry.createReader();
+      var collected = [];
+      var step = function () {
+        reader.readEntries(function (batch) {
+          if (!batch.length) { resolve(collected); return; }
+          for (var i = 0; i < batch.length; i++) collected.push(batch[i]);
+          step(); // readEntries hands back at most 100 entries per call
+        }, function () { resolve(collected); });
+      };
+      step();
+    });
+  }
+
+  function walkEntry(entry) {
+    if (!entry) return Promise.resolve([]);
+    if (entry.isFile) {
+      return entryToFile(entry).then(function (f) { return f ? [f] : []; });
+    }
+    if (entry.isDirectory) {
+      return readDirectory(entry).then(function (children) {
+        return Promise.all(children.map(walkEntry)).then(function (groups) {
+          return groups.reduce(function (a, b) { return a.concat(b); }, []);
+        });
+      });
+    }
+    return Promise.resolve([]);
+  }
+
+  /*
+   * A folder dropped on the page is not in dataTransfer.files - browsers only
+   * expose it through the directory entries, which have to be walked.
+   */
+  function dataTransferFiles(dt) {
+    if (!dt) return Promise.resolve([]);
+    if (dt.items && dt.items.length && dt.items[0] && typeof dt.items[0].webkitGetAsEntry === 'function') {
+      var entries = [];
+      for (var i = 0; i < dt.items.length; i++) {
+        var entry = dt.items[i].webkitGetAsEntry();
+        if (entry) entries.push(entry);
+      }
+      if (entries.length) {
+        return Promise.all(entries.map(walkEntry)).then(function (groups) {
+          return groups.reduce(function (a, b) { return a.concat(b); }, []);
+        });
+      }
+    }
+    return Promise.resolve(toArray(dt.files));
+  }
+
+  /*
+   * boot() knows how many parts each group needs, so it can install a validator
+   * that checks the whole selection at once.  A direct loadChunkGroup call falls
+   * back to validating just its own group.
+   */
+  var selectionValidator = null;
+
+  function countKind(files, kind) {
+    var n = 0;
+    for (var i = 0; i < files.length; i++) {
+      var m = CHUNK_PART.exec(files[i].name);
+      if (m && m[1] === kind) n++;
+    }
+    return n;
+  }
+
+  function shortfall(files, kind, expected) {
+    var found = countKind(files, kind);
+    return found === expected ? null : 'found ' + found + ' of ' + expected + ' build.' + kind + '.partNNN';
+  }
+
+  function selectLocalParts(validator) {
+    if (localSelection) return Promise.resolve(localSelection);
+    var check = validator || function () { return null; };
+    return new Promise(function (resolve, reject) {
+      var doc = g.document;
+      var panel = doc && doc.getElementById('chunk-picker');
+      if (!panel) { reject(new Error('No local file picker is available in this page.')); return; }
+      var input = panel.querySelector ? panel.querySelector('input[type=file]') : null;
+      var status = panel.querySelector ? panel.querySelector('#chunk-picker-status') : null;
+      var settled = false;
+
+      function setStatus(text) { if (status) status.textContent = text; }
+
+      function accept(fileSource) {
+        return Promise.resolve(fileSource).then(function (files) {
+          if (settled) return;
+          var wanted = toArray(files).filter(isChunkPart).sort(byPart);
+          if (wanted.length === 0) {
+            setStatus('Nothing recognised there. Choose the "chunks" folder itself, or the build.data.partNNN and build.wasm.partNNN files inside it.');
+            return;
+          }
+          var problem = check(wanted);
+          if (problem) {
+            /* Leave the panel open and the promise pending so the user can
+             * simply pick again. */
+            setStatus(problem + '. Choose the "chunks" folder that came with this page.');
+            return;
+          }
+          settled = true;
+          localSelection = wanted;
+          panel.hidden = true;
+          resolve(wanted);
+        }).catch(function (error) {
+          setStatus('Could not read that selection: ' + (error && error.message ? error.message : error));
+        });
+      }
+
+      function openDialog() { if (input && typeof input.click === 'function') input.click(); }
+
+      panel.hidden = false;
+      setStatus('Choose the "chunks" folder that came with this page (click anywhere in this box), or drop it here.');
+
+      if (input) input.addEventListener('change', function () { accept(toArray(input.files)); });
+      /* Any click inside the panel opens the dialog - the button included, since
+       * its click bubbles up here. */
+      panel.addEventListener('click', function (e) { if (e && e.target === input) return; openDialog(); });
+      panel.addEventListener('dragover', function (e) { e.preventDefault(); });
+      panel.addEventListener('drop', function (e) { e.preventDefault(); accept(dataTransferFiles(e.dataTransfer)); });
+      /* A drop that misses the panel must not navigate the page away. */
+      if (doc && doc.addEventListener) {
+        doc.addEventListener('dragover', function (e) { e.preventDefault(); });
+        doc.addEventListener('drop', function (e) { e.preventDefault(); });
+      }
+    });
+  }
+
+  /*
+   * The manifest labels its groups "build.data" and "build.wasm", while the file
+   * names carry only "data" / "wasm" - compare on that, not on the whole label.
+   */
+  function chunkKind(label) {
+    var m = /(?:^|\.)(data|wasm)$/.exec(String(label));
+    return m ? m[1] : String(label);
+  }
+
+  function groupFromFiles(files, label, expected) {
+    var kind = chunkKind(label);
+    var parts = files.filter(function (f) {
+      var m = CHUNK_PART.exec(f.name);
+      return !!m && m[1] === kind;
+    });
+    if (parts.length !== expected) {
+      throw new Error('Found ' + parts.length + ' of the ' + expected + ' ' + label +
+        '.partNNN files in that selection. Choose the "chunks" folder that came with this page.');
+    }
     return parts;
   }
 
@@ -495,8 +624,21 @@
     }
 
     function fromLocal() {
-      return pickLocalFiles(parts.length).then(function (files) {
-        var mine = groupFromFiles(files, group.label);
+      var kind = chunkKind(group.label);
+      var validator = selectionValidator || function (files) {
+        var p = shortfall(files, kind, parts.length);
+        return p ? p.charAt(0).toUpperCase() + p.slice(1) : null;
+      };
+      return selectLocalParts(validator).then(function (files) {
+        var mine;
+        try {
+          mine = groupFromFiles(files, group.label, parts.length);
+        } catch (error) {
+          /* A short or wrong pick must not be remembered, or the user could
+           * never retry. */
+          localSelection = null;
+          throw error;
+        }
         for (var i = 0; i < mine.length; i++) {
           blobs.push(mine[i]);
           if (onProgress) onProgress(i + 1, mine.length, group.label);
@@ -569,6 +711,20 @@
   function boot() {
     computePageDir();
     var config = readJsonBlock('build-config') || {};
+    if (config.chunks && config.chunks.data && config.chunks.wasm) {
+      var wantData = config.chunks.data.parts.length;
+      var wantWasm = config.chunks.wasm.parts.length;
+      selectionValidator = function (files) {
+        var problems = [];
+        var a = shortfall(files, 'data', wantData);
+        var b = shortfall(files, 'wasm', wantWasm);
+        if (a) problems.push(a);
+        if (b) problems.push(b);
+        return problems.length
+          ? 'Not all parts are there (' + problems.join(', ') + ')'
+          : null;
+      };
+    }
     var assetCount = buildVfs(config);
     installFetchPatch();
     installXhrPatch();
@@ -660,6 +816,9 @@
     registerInlineBlock: registerInlineBlock,
     materializeInline: materializeInline,
     loadChunkGroup: loadChunkGroup,
+    /* test hooks */
+    _resetLocalSelection: function () { localSelection = null; selectionValidator = null; },
+    shortfall: shortfall,
     resolveKey: resolveKey,
     applyRange: applyRange,
     responseHeaders: responseHeaders,
