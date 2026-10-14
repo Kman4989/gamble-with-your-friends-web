@@ -529,10 +529,16 @@
             return;
           }
           var problem = check(wanted);
+          var bad = problem ? [] : sizeProblems(wanted);
+          if (!problem && bad.length) {
+            problem = bad.length > 3
+              ? bad.slice(0, 3).join('; ') + ' (+' + (bad.length - 3) + ' more)'
+              : bad.join('; ');
+          }
           if (problem) {
             /* Leave the panel open and the promise pending so the user can
              * simply pick again. */
-            setStatus(problem + '. Choose the "chunks" folder that came with this page.');
+            setStatus(problem + '. Re-copy or re-download those files, then pick the folder again.');
             return;
           }
           settled = true;
@@ -567,6 +573,51 @@
    * The manifest labels its groups "build.data" and "build.wasm", while the file
    * names carry only "data" / "wasm" - compare on that, not on the whole label.
    */
+  var partSizes = {}; // "build.data.part001" -> expected bytes, when known
+
+  function baseName(p) {
+    var i = String(p).lastIndexOf('/');
+    return i === -1 ? String(p) : String(p).slice(i + 1);
+  }
+
+  function registerPartSizes(group) {
+    if (!group || !group.sizes) return;
+    for (var i = 0; i < group.parts.length; i++) {
+      partSizes[baseName(group.parts[i])] = group.sizes[i];
+    }
+  }
+
+  function groupTotal(group) {
+    if (!group.sizes) return null;
+    var t = 0;
+    for (var i = 0; i < group.sizes.length; i++) t += group.sizes[i];
+    return t;
+  }
+
+  /* A truncated file is the failure mode that otherwise shows up much later as
+   * "section extends past end of the module", with no hint about which file. */
+  function sizeProblems(files) {
+    var problems = [];
+    for (var i = 0; i < files.length; i++) {
+      var want = partSizes[files[i].name];
+      if (want !== undefined && files[i].size !== want) {
+        problems.push(files[i].name + ' is ' + files[i].size + ' bytes but should be ' + want);
+      }
+    }
+    return problems;
+  }
+
+  function checkPartSize(name, got) {
+    var want = partSizes[name];
+    if (want === undefined || got === want) return null;
+    var diff = want - got;
+    return name + ' is ' + got + ' bytes but should be ' + want + ' (' + Math.abs(diff) +
+      ' bytes ' + (diff > 0 ? 'missing' : 'extra') + '). ' +
+      (diff > 0
+        ? 'The copy is incomplete - re-download or re-copy that file.'
+        : 'That file does not belong to this build.');
+  }
+
   function chunkKind(label) {
     var m = /(?:^|\.)(data|wasm)$/.exec(String(label));
     return m ? m[1] : String(label);
@@ -591,6 +642,7 @@
   function loadChunkGroup(group, onProgress) {
     var parts = group.parts;
     var blobs = [];
+    registerPartSizes(group);
 
     function inlineAll() {
       return parts.every(function (p) { return inlineBlocks.has(normKey(p)); });
@@ -614,6 +666,8 @@
             if (!r.ok) throw new Error('Could not load ' + part + ' (HTTP ' + r.status + ')');
             return r.blob();
           }).then(function (blob) {
+            var problem = checkPartSize(baseName(part), blob.size);
+            if (problem) throw new Error(problem);
             blobs.push(blob);
             if (onProgress) onProgress(i + 1, parts.length, group.label);
           });
@@ -647,8 +701,20 @@
       });
     }
 
-    if (inlineAll()) return Promise.resolve().then(fromInline);
-    return httpProbe(parts[0]).then(function (ok) { return ok ? fromHttp() : fromLocal(); });
+    function verify(blob) {
+      var want = groupTotal(group);
+      if (want !== null && blob.size !== want) {
+        throw new Error(group.label + ' assembled to ' + blob.size + ' bytes but its ' +
+          parts.length + ' parts add up to ' + want + ' - ' + (want - blob.size) +
+          ' bytes are missing.');
+      }
+      return blob;
+    }
+
+    if (inlineAll()) return Promise.resolve().then(fromInline).then(verify);
+    return httpProbe(parts[0]).then(function (ok) {
+      return (ok ? fromHttp() : fromLocal()).then(verify);
+    });
   }
 
   /* ------------------------------------------------------------------ *
@@ -817,7 +883,9 @@
     materializeInline: materializeInline,
     loadChunkGroup: loadChunkGroup,
     /* test hooks */
-    _resetLocalSelection: function () { localSelection = null; selectionValidator = null; },
+    _resetLocalSelection: function () { localSelection = null; selectionValidator = null; partSizes = {}; },
+    sizeProblems: sizeProblems,
+    checkPartSize: checkPartSize,
     shortfall: shortfall,
     resolveKey: resolveKey,
     applyRange: applyRange,

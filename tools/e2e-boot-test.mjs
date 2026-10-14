@@ -91,6 +91,12 @@ for (const [label, group] of Object.entries(config.chunks)) {
     if (label === 'data') expectedData += payload.length; else expectedWasm += payload.length;
   });
 }
+/* The stand-in parts are tiny, so rewrite the manifest's recorded sizes to
+ * match them - otherwise the runtime's truncation check (correctly) rejects
+ * them.  The real sizes are exercised by tools/check-chunks.mjs. */
+for (const group of Object.values(config.chunks)) {
+  if (group.sizes) group.sizes = group.parts.map((rel) => partBytes.get(rel).length);
+}
 console.log(`mode: chunks ${inlinedChunks ? 'inlined in the document' : 'fetched over HTTP'}`);
 
 /* ---------------- serve it ---------------- */
@@ -133,7 +139,7 @@ el('unity-canvas', (id) => ({ id, focus() { this.focused = true; } }));
 el('loading', (id) => ({ id, remove() { this.removed = true; } }));
 el('error', (id) => ({ id, hidden: true, textContent: '' }));
 el('vfs-data', (id) => ({ id, textContent: vfsBlock }));
-el('build-config', (id) => ({ id, textContent: configBlock }));
+el('build-config', (id) => ({ id, textContent: JSON.stringify(config) }));
 el('unity-loader-src', (id) => ({ id, textContent: loaderBlockText }));
 el('unity-framework-src', (id) => ({ id, textContent: frameworkBlockText }));
 /* An --inline-all build keeps the chunk parts in the document as base64 blocks

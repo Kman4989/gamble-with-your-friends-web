@@ -627,6 +627,71 @@ check('stray drop is prevented', navigated);
 globalThis.fetch = vfsFetch;
 
 
+/* --- truncated transfers are named, not deferred to WebAssembly ----- */
+{
+  solo._resetLocalSelection();
+  check('checkPartSize ignores a part with no recorded size',
+    solo.checkPartSize('build.wasm.part019', 12582912) === null);
+
+  /* a part that arrives short over HTTP must be reported at once */
+  globalThis.fetch = (url, init) => {
+    const method = (init && init.method) || 'GET';
+    if (method === 'HEAD') return Promise.resolve(new Response(null, { status: 200 }));
+    return Promise.resolve(new Response(new Uint8Array(12582912), { status: 200 }));
+  };
+  let httpError = null;
+  await solo.loadChunkGroup({
+    label: 'build.wasm', type: 'application/wasm',
+    parts: ['chunks/build.wasm.part019'], sizes: [13769441]
+  }).catch((e) => { httpError = e.message; });
+  check('short part over HTTP is caught before Unity sees it',
+    /build\.wasm\.part019 is 12582912 bytes but should be 13769441/.test(String(httpError)),
+    String(httpError));
+
+  /* the sizes are now registered, so the helper can be checked directly */
+  const msg = solo.checkPartSize('build.wasm.part019', 12582912);
+  check('checkPartSize names a short part',
+    /build\.wasm\.part019 is 12582912 bytes but should be 13769441/.test(msg) &&
+    /1186529 bytes missing/.test(msg) && /incomplete/.test(msg), msg);
+  check('checkPartSize is quiet for a correct part',
+    solo.checkPartSize('build.wasm.part019', 13769441) === null);
+
+  /* the picker rejects a truncated file on disk instead of building a bad blob */
+  solo._resetLocalSelection();
+  globalThis.fetch = () => Promise.resolve(new Response(null, { status: 404 }));
+  const ui = installPickerPanel();
+  let settled = null;
+  solo.loadChunkGroup({
+    label: 'build.wasm', type: 'application/wasm',
+    parts: ['chunks/build.wasm.part019'], sizes: [13769441]
+  }).then(() => { settled = 'resolved'; }, (e) => { settled = e.message; });
+  await tick();
+  ui.input.files = [namedBlob('build.wasm.part019', new Uint8Array(12582912))];
+  ui.input.fire('change');
+  await tick();
+  check('truncated file on disk keeps the picker open with the size reported',
+    settled === null && ui.panel.hidden === false &&
+    /is 12582912 bytes but should be 13769441/.test(ui.status.textContent),
+    'settled=' + settled + ' | ' + ui.status.textContent);
+
+  /* an inlined block whose length disagrees with the manifest is caught too */
+  solo._resetLocalSelection();
+  blocks.set('inline-short-001', Buffer.from(new Uint8Array(7)).toString('base64'));
+  elements.set('inline-short-001', { id: 'inline-short-001', textContent: blocks.get('inline-short-001') });
+  globalThis.document.getElementById = (id) => {
+    if (id === 'inline-short-001') return elements.get('inline-short-001');
+    return blocks.has(id) ? { textContent: blocks.get(id) } : null;
+  };
+  solo.registerInlineBlock('chunks/build.wasm.part019', 'inline-short-001', 'application/wasm');
+  let inlineError = null;
+  await solo.loadChunkGroup({
+    label: 'build.wasm', type: 'application/wasm',
+    parts: ['chunks/build.wasm.part019'], sizes: [13769441]
+  }).catch((e) => { inlineError = e.message; });
+  check('inlined part of the wrong length is caught',
+    /assembled to 7 bytes but its 1 parts add up to 13769441/.test(String(inlineError)), String(inlineError));
+}
+
 /* ------------------------------------------------------------------ */
 section('D. chunk manifest vs files on disk');
 

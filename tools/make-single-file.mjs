@@ -99,6 +99,12 @@ function listChunkParts(chunksDir, label) {
     .map((n) => `chunks/${n}`);
 }
 
+/* Recorded so a truncated download can be named instead of surfacing later as a
+ * WebAssembly CompileError. */
+function partSizes(srcDir, parts) {
+  return parts.map((rel) => fs.statSync(path.join(srcDir, rel)).size);
+}
+
 function human(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   const units = ['KiB', 'MiB', 'GiB', 'TiB'];
@@ -174,8 +180,14 @@ function main() {
 
   const buildConfig = {
     chunks: {
-      data: { label: 'build.data', type: 'application/octet-stream', parts: dataParts },
-      wasm: { label: 'build.wasm', type: 'application/wasm', parts: wasmParts }
+      data: {
+        label: 'build.data', type: 'application/octet-stream', parts: dataParts,
+        sizes: partSizes(src, dataParts)
+      },
+      wasm: {
+        label: 'build.wasm', type: 'application/wasm', parts: wasmParts,
+        sizes: partSizes(src, wasmParts)
+      }
     },
     frameworkUrl: opts.inlineFramework ? null : 'Build/build.framework.js',
     inlinedChunks: null,

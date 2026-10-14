@@ -52,6 +52,10 @@ browser memory on a real machine. It is off by default for that reason.
 node tools/serve.mjs 8000 game     # http://localhost:8000/ -> /solo.html
 ```
 
+If the game fails to start with a `CompileError`, run
+`node tools/check-chunks.mjs` first: it tells you whether the files on disk are
+complete.
+
 **From disk, no server** — open `game/solo.html` directly with `file://`. The
 launcher, engine and every asset come from the document; the page then asks you
 to pick the `chunks` folder (or drop it on the window) and runs entirely from
@@ -72,6 +76,31 @@ small in-memory virtual file system and routes both `fetch()` and
 including `Range` requests (the in-game monitors stream their video that way);
 anything else falls through to the real network untouched. `blob:` and `data:`
 URLs are never intercepted.
+
+## Integrity checks
+
+A chunk part that arrives short used to surface much later as
+
+```
+CompileError: WebAssembly.instantiate(): section (code 0, "Unknown") extends past
+end of the module (length 55728641, remaining bytes 54542112) @+282040795
+```
+
+which says nothing about which file is at fault. Every part's byte size is now
+recorded in the manifest at generation time and checked on all three paths:
+
+- over HTTP, each part is measured as it lands;
+- from the folder picker, each `File.size` is checked before the pick is
+  accepted, so the panel names the bad file and stays open;
+- the assembled blob's total is compared against the sum of its parts.
+
+The message names the file and the delta, e.g.
+`build.wasm.part019 is 12582912 bytes but should be 13769441 (1186529 bytes
+missing). The copy is incomplete - re-download or re-copy that file.`
+
+`tools/check-chunks.mjs` goes further on a checkout: it assembles the real parts
+through the shipped `loadChunkGroup`, compares the result byte-for-byte with a
+direct `cat` of the same files, then runs `WebAssembly.compile` on the module.
 
 ## Regenerating and testing
 
@@ -99,7 +128,7 @@ the file dialog, a dropped folder has to be walked through its directory entries
 a short or wrong pick has to be reported and leave the picker open for another
 try, and one full pick has to serve both the data and the wasm group.
 
-Both pass here: 103 and 23 checks.
+Both pass here: 109 and 23 checks.
 
 One thing that is **not** covered: this sandbox has no browser, so Unity itself
 was never executed. Everything up to and including the config handed to
@@ -115,3 +144,4 @@ was never executed. Everything up to and including the config handed to
 | `tools/verify-single-file.mjs` | structure, fidelity, runtime and manifest checks |
 | `tools/e2e-boot-test.mjs` | end-to-end boot of the generated document |
 | `tools/serve.mjs` | static server with `Range` support and correct content types |
+| `tools/check-chunks.mjs` | assembles and compiles the real 1.2 GiB of chunk parts |
