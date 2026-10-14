@@ -1,0 +1,14 @@
+{
+  "name": "gamble-with-your-friends-web",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Gamble With Your Friends - solo web port. Single-file build tooling.",
+  "scripts": {
+    "build": "node tools/make-single-file.mjs",
+    "build:inline-all": "node tools/make-single-file.mjs --inline-all",
+    "verify": "node tools/verify-single-file.mjs",
+    "test:e2e": "node tools/e2e-boot-test.mjs",
+    "test": "node tools/verify-single-file.mjs && node tools/e2e-boot-test.mjs",
+    "serve": "node tools/serve.mjs 8000 game"
+  }
+}
