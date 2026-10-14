@@ -748,6 +748,165 @@ globalThis.fetch = vfsFetch;
       .test(String(assemblyError)), String(assemblyError));
 }
 
+/* --- the chosen folder is remembered between visits ------------------ */
+function makeFakeIDB() {
+  const data = new Map();
+  const req = (result) => {
+    const r = { result, onsuccess: null, onerror: null };
+    setTimeout(() => { if (r.onsuccess) r.onsuccess(); }, 0);
+    return r;
+  };
+  return {
+    _data: data,
+    open() {
+      const r = { result: null, onupgradeneeded: null, onsuccess: null, onerror: null, onblocked: null };
+      setTimeout(() => {
+        r.result = {
+          objectStoreNames: { contains: () => true },
+          createObjectStore() {},
+          transaction: () => ({
+            objectStore: () => ({
+              put: (v, k) => { data.set(k, v); return req(undefined); },
+              get: (k) => req(data.has(k) ? data.get(k) : undefined)
+            })
+          })
+        };
+        if (r.onupgradeneeded) r.onupgradeneeded();
+        if (r.onsuccess) r.onsuccess();
+      }, 0);
+      return r;
+    }
+  };
+}
+function fakeDirHandle(files, opts) {
+  opts = opts || {};
+  return {
+    kind: 'directory',
+    queryPermission: () => Promise.resolve(opts.perm || 'prompt'),
+    requestPermission: () => Promise.resolve('granted'),
+    getDirectoryHandle: (name) => (opts.subFiles
+      ? Promise.resolve(fakeDirHandle(opts.subFiles))
+      : Promise.reject(new Error('NotFoundError: ' + name))),
+    entries() {
+      const list = files.map((f) => [f.name, { kind: 'file', getFile: () => Promise.resolve(f) }]);
+      let i = 0;
+      return { next: () => Promise.resolve(i < list.length ? { done: false, value: list[i++] } : { done: true }) };
+    }
+  };
+}
+const onePart = { label: 'build.wasm', type: 'application/wasm', parts: ['chunks/build.wasm.part001'], sizes: [9] };
+
+/* A: a folder chosen earlier, still granted -> loads with no interaction */
+{
+  solo._resetLocalSelection();
+  globalThis.fetch = () => Promise.resolve(new Response(null, { status: 404 }));
+  const idb = makeFakeIDB();
+  globalThis.indexedDB = idb;
+  const handle = fakeDirHandle([namedBlob('build.wasm.part001', Buffer.alloc(9))], { perm: 'granted' });
+  await solo.rememberDirectory(handle);
+  check('chosen folder is kept in IndexedDB', idb._data.get('chunksDirectory') === handle);
+
+  const ui = installPickerPanel();
+  let pickerCalls = 0;
+  globalThis.showDirectoryPicker = () => { pickerCalls++; return Promise.reject(new Error('not reached')); };
+  const blob = await solo.loadChunkGroup(onePart);
+  check('remembered folder with granted permission loads without asking',
+    blob.size === 9 && ui.panel.hidden === true && pickerCalls === 0 && ui.input.clicks === 0,
+    `${blob.size} bytes, picker calls ${pickerCalls}, dialog opens ${ui.input.clicks}`);
+  const again = await solo.recallDirectory();
+  check('the folder is still remembered afterwards', again === handle);
+}
+
+/* B: permission is only a prompt -> ask, then remember the new choice */
+{
+  solo._resetLocalSelection();
+  const idb = makeFakeIDB();
+  globalThis.indexedDB = idb;
+  await solo.rememberDirectory(fakeDirHandle([namedBlob('build.wasm.part001', Buffer.alloc(9))], { perm: 'prompt' }));
+  const ui = installPickerPanel();
+  const fresh = fakeDirHandle([namedBlob('build.wasm.part001', Buffer.alloc(9))], { perm: 'granted' });
+  let pickerCalls = 0;
+  globalThis.showDirectoryPicker = () => { pickerCalls++; return Promise.resolve(fresh); };
+  const p = solo.loadChunkGroup(onePart);
+  await tick(); await tick();
+  check('panel stays up when re-consent is needed', ui.panel.hidden === false && pickerCalls === 0);
+  ui.panel.fire('click', { target: { tagName: 'BUTTON' } });
+  const blob = await p;
+  check('one click uses the directory picker instead of the file input',
+    pickerCalls === 1 && ui.input.clicks === 0, `picker ${pickerCalls}, dialog ${ui.input.clicks}`);
+  check('the new choice replaces the old one', idb._data.get('chunksDirectory') === fresh);
+  check('files load from the chosen folder', blob.size === 9, blob.size + ' bytes');
+}
+
+/* C: picking the folder that *contains* chunks descends into it */
+{
+  solo._resetLocalSelection();
+  globalThis.indexedDB = makeFakeIDB();
+  const parts = [namedBlob('build.wasm.part001', Buffer.alloc(9))];
+  /* outer folder holds nothing recognisable; only chunks/ has the parts */
+  const outer = fakeDirHandle([namedBlob('index.html', Buffer.from('<html>'))], { perm: 'granted', subFiles: parts });
+  globalThis.showDirectoryPicker = () => Promise.resolve(outer);
+  const ui = installPickerPanel();
+  const p = solo.loadChunkGroup(onePart);
+  await tick();
+  ui.panel.fire('click', { target: { tagName: 'BUTTON' } });
+  const blob = await p;
+  check('picking the parent folder descends into chunks/', blob.size === 9, blob.size + ' bytes');
+}
+
+/* D: a folder with nothing usable leaves the panel open */
+{
+  solo._resetLocalSelection();
+  globalThis.indexedDB = makeFakeIDB();
+  globalThis.showDirectoryPicker = () => Promise.resolve(fakeDirHandle([namedBlob('notes.txt', Buffer.from('x'))], { perm: 'granted' }));
+  const ui = installPickerPanel();
+  let settled = null;
+  solo.loadChunkGroup(onePart).then(() => { settled = 'resolved'; }, (e) => { settled = e.message; });
+  await tick();
+  ui.panel.fire('click', { target: { tagName: 'BUTTON' } });
+  await tick(); await tick();
+  check('an empty folder is reported and the panel stays open',
+    settled === null && ui.panel.hidden === false && /Nothing recognised/.test(ui.status.textContent),
+    'settled=' + settled + ' | ' + ui.status.textContent.slice(0, 40) + '…');
+}
+
+/* E: a cancelled picker is not an error */
+{
+  solo._resetLocalSelection();
+  globalThis.indexedDB = makeFakeIDB();
+  const abort = new Error('cancelled');
+  abort.name = 'AbortError';
+  globalThis.showDirectoryPicker = () => Promise.reject(abort);
+  const ui = installPickerPanel();
+  let settled = null;
+  solo.loadChunkGroup(onePart).then(() => { settled = 'resolved'; }, (e) => { settled = e.message; });
+  await tick();
+  ui.panel.fire('click', { target: { tagName: 'BUTTON' } });
+  await tick(); await tick();
+  check('cancelling the picker just leaves the panel up',
+    settled === null && ui.panel.hidden === false && ui.status.textContent.indexOf('Could not read') === -1,
+    ui.status.textContent.slice(0, 40) + '…');
+}
+
+/* F: no picker API (the file:// case) falls back to the plain input */
+{
+  solo._resetLocalSelection();
+  globalThis.indexedDB = undefined;
+  delete globalThis.showDirectoryPicker;
+  const ui = installPickerPanel();
+  let settled = null;
+  solo.loadChunkGroup(onePart).then(() => { settled = 'resolved'; }, (e) => { settled = e.message; });
+  await tick();
+  check('without the picker API the panel explains the manual route',
+    /click anywhere in this box/i.test(ui.status.textContent), ui.status.textContent.slice(0, 48) + '…');
+  ui.panel.fire('click', { target: { tagName: 'BUTTON' } });
+  check('without the picker API the click opens the file input', ui.input.clicks === 1);
+  ui.input.files = [namedBlob('build.wasm.part001', Buffer.alloc(9))];
+  ui.input.fire('change');
+  const blob = await solo.loadChunkGroup(onePart);
+  check('the fallback still loads the chunks', blob.size === 9, blob.size + ' bytes');
+}
+
 /* ------------------------------------------------------------------ */
 section('D. chunk manifest vs files on disk');
 

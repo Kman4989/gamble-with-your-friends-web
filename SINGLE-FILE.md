@@ -63,8 +63,26 @@ memory. This is the path that makes the single file usable without hosting
 anything.
 
 Pick the `chunks` **folder itself**, not its parent and not one file at a time —
-the page needs all 69 parts. It counts what you selected and tells you exactly
-what is missing if the pick is short, so you can try again without reloading.
+the page needs all 69 parts. (Picking the parent works too; the page descends
+into a `chunks` subfolder if it finds one.) It counts what you selected, checks
+every file's size, and tells you exactly what is missing if the pick is short.
+
+### Do you have to pick it every time?
+
+Only on `file://`. Where the browser allows it, the folder is remembered:
+
+- The page uses the File System Access API (`showDirectoryPicker`) and stores the
+  directory handle in IndexedDB. On the next visit, if read access is still
+  granted, it loads straight away with no prompt at all. If the browser wants
+  re-consent, it is one click on the button rather than navigating the tree
+  again.
+- `file://` pages generally get neither the API nor IndexedDB, so those fall
+  back to the plain folder input and you pick on each load.
+
+**If you want to never pick again, serve the folder** (`node tools/serve.mjs
+8000 game`, or any static server). Over HTTP the page finds `chunks/` by itself
+on every load — the picker only exists because `file://` cannot read a directory
+on its own.
 
 **One file** — `--inline-all`, as above. Needs nothing beside it.
 
@@ -135,7 +153,7 @@ the file dialog, a dropped folder has to be walked through its directory entries
 a short or wrong pick has to be reported and leave the picker open for another
 try, and one full pick has to serve both the data and the wasm group.
 
-Both pass here: 112 and 23 checks.
+Both pass here: 125 and 23 checks.
 
 One thing that is **not** covered: this sandbox has no browser, so Unity itself
 was never executed. Everything up to and including the config handed to

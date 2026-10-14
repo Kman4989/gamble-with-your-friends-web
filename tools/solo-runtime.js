@@ -507,6 +507,78 @@
     return found === expected ? null : 'found ' + found + ' of ' + expected + ' build.' + kind + '.partNNN';
   }
 
+  /* ------------------------------------------------------------------ *
+   * remembering the chosen folder between visits
+   *
+   * A FileSystemDirectoryHandle is structured-cloneable, so it can be kept in
+   * IndexedDB and reused.  When the browser still grants read access the user is
+   * not asked again at all; when it wants re-consent it is one click instead of
+   * navigating the folder tree again.  Pages opened from file:// usually get
+   * neither, and fall back to the plain folder input.
+   * ------------------------------------------------------------------ */
+
+  var HANDLE_DB = 'gwfyf-solo';
+  var HANDLE_STORE = 'kv';
+  var HANDLE_KEY = 'chunksDirectory';
+
+  function idb() {
+    return new Promise(function (resolve) {
+      if (!g.indexedDB) { resolve(null); return; }
+      var req;
+      try { req = g.indexedDB.open(HANDLE_DB, 1); } catch (e) { resolve(null); return; }
+      req.onupgradeneeded = function () {
+        try {
+          if (!req.result.objectStoreNames.contains(HANDLE_STORE)) req.result.createObjectStore(HANDLE_STORE);
+        } catch (e) { /* ignore */ }
+      };
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { resolve(null); };
+      req.onblocked = function () { resolve(null); };
+    });
+  }
+
+  function idbValue(write, value) {
+    return idb().then(function (db) {
+      if (!db) return null;
+      return new Promise(function (resolve) {
+        try {
+          var tx = db.transaction(HANDLE_STORE, write ? 'readwrite' : 'readonly');
+          var req = write ? tx.objectStore(HANDLE_STORE).put(value, HANDLE_KEY)
+            : tx.objectStore(HANDLE_STORE).get(HANDLE_KEY);
+          req.onsuccess = function () { resolve(req.result === undefined ? null : req.result); };
+          req.onerror = function () { resolve(null); };
+        } catch (e) { resolve(null); }
+      });
+    });
+  }
+
+  function rememberDirectory(handle) { return idbValue(true, handle); }
+  function recallDirectory() { return idbValue(false, null); }
+
+  /* The user may pick "chunks" itself or the folder holding it. */
+  function filesFromDirectory(dirHandle) {
+    return Promise.resolve().then(function () {
+      if (typeof dirHandle.getDirectoryHandle !== 'function') return dirHandle;
+      return dirHandle.getDirectoryHandle('chunks', { mode: 'read' })
+        .then(function (sub) { return sub; }, function () { return dirHandle; });
+    }).then(function (dir) {
+      var out = [];
+      var it = dir.entries();
+      var step = function () {
+        return it.next().then(function (r) {
+          if (r.done) return out;
+          var name = r.value[0];
+          var entry = r.value[1];
+          if (entry.kind === 'file' && CHUNK_PART.test(name)) {
+            return entry.getFile().then(function (f) { out.push(f); return step(); });
+          }
+          return step();
+        });
+      };
+      return step();
+    });
+  }
+
   function selectLocalParts(validator) {
     if (localSelection) return Promise.resolve(localSelection);
     var check = validator || function () { return null; };
@@ -552,19 +624,49 @@
 
       function openDialog() { if (input && typeof input.click === 'function') input.click(); }
 
+      var canRemember = typeof g.showDirectoryPicker === 'function';
+
       panel.hidden = false;
-      setStatus('Choose the "chunks" folder that came with this page (click anywhere in this box), or drop it here.');
+      setStatus(canRemember
+        ? 'Choose the "chunks" folder that came with this page. You only have to do this once - the page remembers it.'
+        : 'Choose the "chunks" folder that came with this page (click anywhere in this box), or drop it here.');
 
       if (input) input.addEventListener('change', function () { accept(toArray(input.files)); });
       /* Any click inside the panel opens the dialog - the button included, since
        * its click bubbles up here. */
-      panel.addEventListener('click', function (e) { if (e && e.target === input) return; openDialog(); });
+      panel.addEventListener('click', function (e) {
+        if (e && e.target === input) return;
+        if (!canRemember) { openDialog(); return; }
+        g.showDirectoryPicker({ id: 'gwfyf-chunks', mode: 'read' }).then(function (handle) {
+          return rememberDirectory(handle).then(function () { return filesFromDirectory(handle); });
+        }).then(function (files) {
+          return accept(files);
+        }).catch(function (error) {
+          if (error && error.name === 'AbortError') return; // user cancelled
+          setStatus('Could not read that folder: ' + (error && error.message ? error.message : error));
+        });
+      });
       panel.addEventListener('dragover', function (e) { e.preventDefault(); });
       panel.addEventListener('drop', function (e) { e.preventDefault(); accept(dataTransferFiles(e.dataTransfer)); });
       /* A drop that misses the panel must not navigate the page away. */
       if (doc && doc.addEventListener) {
         doc.addEventListener('dragover', function (e) { e.preventDefault(); });
         doc.addEventListener('drop', function (e) { e.preventDefault(); });
+      }
+
+      /* A folder chosen on an earlier visit: use it without asking when the
+       * browser still grants read access. */
+      if (canRemember) {
+        recallDirectory().then(function (handle) {
+          if (!handle || settled || typeof handle.queryPermission !== 'function') return null;
+          return handle.queryPermission({ mode: 'read' }).then(function (perm) {
+            return perm === 'granted' ? handle : null;
+          });
+        }).then(function (handle) {
+          if (!handle || settled) return null;
+          setStatus('Using the chunks folder you chose before…');
+          return filesFromDirectory(handle).then(function (files) { return accept(files); });
+        }).catch(function () { /* fall back to asking */ });
       }
     });
   }
@@ -906,6 +1008,9 @@
     _resetLocalSelection: function () { localSelection = null; selectionValidator = null; partSizes = {}; },
     sizeProblems: sizeProblems,
     checkPartSize: checkPartSize,
+    filesFromDirectory: filesFromDirectory,
+    rememberDirectory: rememberDirectory,
+    recallDirectory: recallDirectory,
     shortfall: shortfall,
     resolveKey: resolveKey,
     applyRange: applyRange,
