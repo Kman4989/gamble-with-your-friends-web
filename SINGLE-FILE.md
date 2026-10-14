@@ -98,6 +98,13 @@ The message names the file and the delta, e.g.
 `build.wasm.part019 is 12582912 bytes but should be 13769441 (1186529 bytes
 missing). The copy is incomplete - re-download or re-copy that file.`
 
+`boot()` registers the sizes for both groups before loading either, because the
+folder pick happens while the first group is loading - without that, a short
+`build.wasm.*` file would slip past the picker. Each group also re-checks its own
+files after the pick, and the total check lists the offending parts by name, or
+says the bytes were lost while assembling the blob if every part reported the
+right size.
+
 `tools/check-chunks.mjs` goes further on a checkout: it assembles the real parts
 through the shipped `loadChunkGroup`, compares the result byte-for-byte with a
 direct `cat` of the same files, then runs `WebAssembly.compile` on the module.
@@ -128,7 +135,7 @@ the file dialog, a dropped folder has to be walked through its directory entries
 a short or wrong pick has to be reported and leave the picker open for another
 try, and one full pick has to serve both the data and the wasm group.
 
-Both pass here: 109 and 23 checks.
+Both pass here: 112 and 23 checks.
 
 One thing that is **not** covered: this sandbox has no browser, so Unity itself
 was never executed. Everything up to and including the config handed to

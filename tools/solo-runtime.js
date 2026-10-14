@@ -642,6 +642,7 @@
   function loadChunkGroup(group, onProgress) {
     var parts = group.parts;
     var blobs = [];
+    var gotSizes = []; // parallel to parts: what each one actually contributed
     registerPartSizes(group);
 
     function inlineAll() {
@@ -653,6 +654,7 @@
         var entry = materializeInline(normKey(parts[i]));
         if (!entry) throw new Error('Missing inlined chunk ' + parts[i]);
         blobs.push(new g.Blob([entry.bytes]));
+        gotSizes.push(entry.bytes.length);
         vfs.delete(normKey(parts[i]));
         if (onProgress) onProgress(i + 1, parts.length, group.label);
       }
@@ -669,6 +671,7 @@
             var problem = checkPartSize(baseName(part), blob.size);
             if (problem) throw new Error(problem);
             blobs.push(blob);
+            gotSizes[i] = blob.size;
             if (onProgress) onProgress(i + 1, parts.length, group.label);
           });
         });
@@ -693,8 +696,15 @@
           localSelection = null;
           throw error;
         }
+        var problems = sizeProblems(mine);
+        if (problems.length) {
+          localSelection = null;
+          throw new Error(problems.slice(0, 4).join('; ') +
+            (problems.length > 4 ? ' (+' + (problems.length - 4) + ' more)' : ''));
+        }
         for (var i = 0; i < mine.length; i++) {
           blobs.push(mine[i]);
+          gotSizes[i] = mine[i].size;
           if (onProgress) onProgress(i + 1, mine.length, group.label);
         }
         return new g.Blob(blobs, { type: group.type });
@@ -703,12 +713,20 @@
 
     function verify(blob) {
       var want = groupTotal(group);
-      if (want !== null && blob.size !== want) {
-        throw new Error(group.label + ' assembled to ' + blob.size + ' bytes but its ' +
-          parts.length + ' parts add up to ' + want + ' - ' + (want - blob.size) +
-          ' bytes are missing.');
+      if (want === null || blob.size === want) return blob;
+      var bad = [];
+      for (var i = 0; i < parts.length; i++) {
+        if (gotSizes[i] !== undefined && group.sizes[i] !== undefined && gotSizes[i] !== group.sizes[i]) {
+          bad.push(baseName(parts[i]) + ' gave ' + gotSizes[i] + ' of ' + group.sizes[i]);
+        }
       }
-      return blob;
+      var detail = bad.length
+        ? ' Offending parts: ' + bad.slice(0, 6).join(', ') +
+          (bad.length > 6 ? ' (+' + (bad.length - 6) + ' more)' : '') + '.'
+        : ' Every part reported the correct size, so the bytes were lost while assembling the blob.';
+      throw new Error(group.label + ' assembled to ' + blob.size + ' bytes but its ' +
+        parts.length + ' parts add up to ' + want + ' - ' + (want - blob.size) +
+        ' bytes are missing.' + detail);
     }
 
     if (inlineAll()) return Promise.resolve().then(fromInline).then(verify);
@@ -778,6 +796,8 @@
     computePageDir();
     var config = readJsonBlock('build-config') || {};
     if (config.chunks && config.chunks.data && config.chunks.wasm) {
+      registerPartSizes(config.chunks.data);
+      registerPartSizes(config.chunks.wasm);
       var wantData = config.chunks.data.parts.length;
       var wantWasm = config.chunks.wasm.parts.length;
       selectionValidator = function (files) {

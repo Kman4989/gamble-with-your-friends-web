@@ -689,7 +689,63 @@ globalThis.fetch = vfsFetch;
     parts: ['chunks/build.wasm.part019'], sizes: [13769441]
   }).catch((e) => { inlineError = e.message; });
   check('inlined part of the wrong length is caught',
-    /assembled to 7 bytes but its 1 parts add up to 13769441/.test(String(inlineError)), String(inlineError));
+    /assembled to 7 bytes but its 1 parts add up to 13769441/.test(String(inlineError)) &&
+    /Offending parts: build\.wasm\.part019 gave 7 of 13769441/.test(String(inlineError)),
+    String(inlineError));
+
+  /* A short wasm file picked while the DATA group was loading: the pick happens
+   * before the wasm sizes are known, so the wasm group has to re-check. */
+  solo._resetLocalSelection();
+  globalThis.fetch = () => Promise.resolve(new Response(null, { status: 404 }));
+  const ui2 = installPickerPanel();
+  const dataPromise = solo.loadChunkGroup({
+    label: 'build.data', type: 'application/octet-stream',
+    parts: ['chunks/build.data.part001'], sizes: [4]
+  });
+  await tick();
+  ui2.input.files = [namedBlob('build.data.part001', Buffer.alloc(4)),
+    namedBlob('build.wasm.part001', Buffer.alloc(5))]; // short: should be 9
+  ui2.input.fire('change');
+  const okData = await dataPromise;
+  check('data group still loads from that pick', okData.size === 4, okData.size + ' bytes');
+  let lateError = null;
+  await solo.loadChunkGroup({
+    label: 'build.wasm', type: 'application/wasm',
+    parts: ['chunks/build.wasm.part001'], sizes: [9]
+  }).catch((e) => { lateError = e.message; });
+  check('short wasm file is caught by the second group, not deferred to Unity',
+    /build\.wasm\.part001 is 5 bytes but should be 9/.test(String(lateError)), String(lateError));
+
+  /* If every part is the right size but the blob still comes up short, the
+   * message has to say the loss was in assembly rather than blame a file. */
+  solo._resetLocalSelection();
+  /* Build the picked file first: namedBlob() uses the global Blob, and the stub
+   * below must only affect the blob the runtime assembles. */
+  const goodFile = namedBlob('build.data.part001', Buffer.alloc(4));
+  const RealBlob = globalThis.Blob;
+  const sizeDesc = Object.getOwnPropertyDescriptor(RealBlob.prototype, 'size');
+  class ShortBlob extends RealBlob {
+    constructor(parts, opts) {
+      super(parts, opts);
+      const real = sizeDesc.get.call(this);
+      Object.defineProperty(this, 'size', { value: real - 10, configurable: true });
+    }
+  }
+  const ui3 = installPickerPanel();
+  const p3 = solo.loadChunkGroup({
+    label: 'build.data', type: 'application/octet-stream',
+    parts: ['chunks/build.data.part001'], sizes: [4]
+  });
+  await tick();
+  globalThis.Blob = ShortBlob;
+  ui3.input.files = [goodFile];
+  ui3.input.fire('change');
+  let assemblyError = null;
+  await p3.catch((e) => { assemblyError = e.message; });
+  globalThis.Blob = RealBlob;
+  check('a loss inside blob assembly is reported as such, not blamed on a file',
+    /Every part reported the correct size, so the bytes were lost while assembling the blob/
+      .test(String(assemblyError)), String(assemblyError));
 }
 
 /* ------------------------------------------------------------------ */
